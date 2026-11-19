@@ -17,7 +17,7 @@ echo
 echo "[1/6] Detectando sistema operativo..."
 OS="$(uname -s)"
 case "$OS" in
-  Linux*)  ;; 
+  Linux*)  ;;
   *) echo "  ERROR: Este instalador es para Linux. En Windows use install.bat"; exit 1 ;;
 esac
 echo "  Linux detectado."
@@ -54,6 +54,8 @@ MYSQL="$LAMPP/bin/mysql"
 HTDOCS="$LAMPP/htdocs"
 [ -x "$PHPBIN" ] || PHPBIN="$(command -v php)"
 [ -x "$MYSQL" ] || MYSQL="$(command -v mysql)"
+[ -n "$PHPBIN" ] || { echo "  ERROR: PHP no encontrado."; exit 1; }
+[ -n "$MYSQL" ] || { echo "  ERROR: cliente mysql no encontrado."; exit 1; }
 echo
 
 # ---------- 3) Obtener el sistema ----------
@@ -65,59 +67,85 @@ if [ -f "$SRC/public/index.php" ]; then
   mkdir -p "$APPDIR"
   tar cf - --exclude=.git --exclude=.env --exclude=node_modules . | tar xf - -C "$APPDIR"
 else
-  echo "  Descargando desde GitHub..."
+  echo "  Descargando ultima version desde GitHub Releases..."
   TMP="$(mktemp -d)"
-  curl -fL "https://github.com/sashaalejandrar/InversionesEmanuel360/archive/refs/heads/main.zip" -o "$TMP/app.zip" || \
-  curl -fL "https://github.com/sashaalejandrar/InversionesEmanuel360/archive/refs/heads/master.zip" -o "$TMP/app.zip"
-  unzip -q "$TMP/app.zip" -d "$TMP"
+  curl -fL "https://github.com/sashaalejandrar/InversionesEmanuel360-Instalador/releases/latest/download/InversionesEmanuel360.zip" -o "$TMP/app.zip"
+  if command -v unzip >/dev/null; then
+    unzip -q "$TMP/app.zip" -d "$TMP"
+  else
+    python3 -c "import zipfile; zipfile.ZipFile('$TMP/app.zip').extractall('$TMP')"
+  fi
+  SRCZIP=$(find "$TMP" -maxdepth 3 -type f -name index.php -path '*/public/*' | head -1 | xargs -r dirname | xargs -r dirname)
+  [ -z "$SRCZIP" ] && SRCZIP=$(find "$TMP" -maxdepth 2 -type d | head -2 | tail -1)
   rm -rf "$APPDIR"
-  mv "$TMP"/InversionesEmanuel360-* "$APPDIR"
+  mv "$SRCZIP" "$APPDIR"
   rm -rf "$TMP"
 fi
 echo "  Sistema en: $APPDIR"
 echo
 
-# ---------- 4) .env ----------
-echo "[4/6] Configurando entorno..."
-if [ ! -f "$APPDIR/.env" ]; then
-cat > "$APPDIR/.env" <<'ENV'
+# ---------- 4) Iniciar MySQL y detectar clave ----------
+echo "[4/6] Iniciando MySQL y verificando acceso..."
+sudo "$LAMPP/lampp" startmysql >/dev/null 2>&1 || sudo service mysql start >/dev/null 2>&1 || true
+sleep 3
+
+DBPASS=""
+if ! "$MYSQL" -u root -e "SELECT 1" >/dev/null 2>&1; then
+  echo "  MySQL pide contrasena de root. Ingresela:"
+  read -rsp "  Clave root de MySQL (vacio = sin clave): " DBPASS
+  echo
+  if [ -n "$DBPASS" ]; then
+    "$MYSQL" -u root -p"$DBPASS" -e "SELECT 1" >/dev/null 2>&1 || \
+      sudo "$MYSQL" -u root -p"$DBPASS" -e "SELECT 1" >/dev/null 2>&1 || {
+        echo "  ERROR: La clave no funciona."; exit 1; }
+  fi
+else
+  echo "  MySQL responde sin clave (LAMPP default)."
+fi
+echo
+
+# ---------- 5) .env + BD + admin ----------
+echo "[5/6] Configurando base de datos..."
+APPKEY="$(cat /proc/sys/kernel/random/uuid | tr -d '-' )$(cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 32)"
+cat > "$APPDIR/.env" <<ENV
 APP_ENV=production
 APP_DEBUG=false
 APP_URL=http://localhost/InversionesEmanuel
-APP_KEY=
+APP_KEY=$APPKEY
 DB_HOST=127.0.0.1
 DB_PORT=3306
 DB_NAME=inversiones_emanuel
 DB_USER=root
-DB_PASS=
+DB_PASS=$DBPASS
 MAIL_HOST=localhost
 MAIL_PORT=25
 ENV
-fi
 echo "  .env listo."
-echo
 
-# ---------- 5) BD + admin ----------
-echo "[5/6] Creando base de datos e importando..."
-sudo "$LAMPP/lampp" startmysql >/dev/null 2>&1 || sudo service mysql start >/dev/null 2>&1 || true
-sleep 2
-"$MYSQL" -u root -e "CREATE DATABASE IF NOT EXISTS inversiones_emanuel CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null || \
-  sudo "$MYSQL" -u root -e "CREATE DATABASE IF NOT EXISTS inversiones_emanuel CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-for f in "$APPDIR"/database/migrations/*.sql; do
-  echo "  Importando $(basename "$f")..."
-  "$MYSQL" -u root inversiones_emanuel < "$f" 2>/dev/null || \
-    sudo "$MYSQL" -u root inversiones_emanuel < "$f"
-done
+MYSQLARGS=(-u root)
+[ -n "$DBPASS" ] && MYSQLARGS+=(-p"$DBPASS")
 
-ADMINPASS="$(head -c 200 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 12)"
+if "$MYSQL" "${MYSQLARGS[@]}" -e "CREATE DATABASE IF NOT EXISTS inversiones_emanuel CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null || \
+   sudo "$MYSQL" "${MYSQLARGS[@]}" -e "CREATE DATABASE IF NOT EXISTS inversiones_emanuel CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"; then
+  for f in "$APPDIR"/database/migrations/*.sql; do
+    echo "  Importando $(basename "$f")..."
+    "$MYSQL" "${MYSQLARGS[@]}" inversiones_emanuel < "$f" 2>/dev/null || \
+      sudo "$MYSQL" "${MYSQLARGS[@]}" inversiones_emanuel < "$f"
+  done
+  echo "  Base de datos lista."
+else
+  echo "  AVISO: no se pudo crear la base de datos. Reintente mas tarde."
+fi
+
+ADMINPASS="$(cat /proc/sys/kernel/random/uuid | tr -dc 'a-zA-Z0-9' | head -c 12)"
 [ ${#ADMINPASS} -lt 8 ] && ADMINPASS="Admin2026!"
 echo "  Creando usuario administrador..."
 "$PHPBIN" "$APPDIR/scripts/install_cli.php" admin "Administrador" "admin@local" "$ADMINPASS" || \
-  sudo -u "$(whoami)" "$PHPBIN" "$APPDIR/scripts/install_cli.php" admin "Administrador" "admin@local" "$ADMINPASS"
+  sudo -u "$(whoami)" "$PHPBIN" "$APPDIR/scripts/install_cli.php" admin "Administrador" "admin@local" "$ADMINPASS" || true
 echo
 
 # ---------- 6) Arranque ----------
-echo "[6/6] Arrancando servicios..."
+echo "[6/6] Arrancando Apache..."
 sudo "$LAMPP/lampp" startapache >/dev/null 2>&1 || sudo service apache2 start >/dev/null 2>&1 || true
 sleep 3
 echo
